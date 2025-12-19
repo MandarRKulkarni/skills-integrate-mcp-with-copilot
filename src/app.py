@@ -5,11 +5,18 @@ A super simple FastAPI application that allows students to view and sign up
 for extracurricular activities at Mergington High School.
 """
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Depends
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import RedirectResponse
 import os
 from pathlib import Path
+from datetime import datetime, timedelta
+from typing import Optional
+
+# auth
+from jose import jwt, JWTError
+from passlib.hash import bcrypt
+from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 
 app = FastAPI(title="Mergington High School API",
               description="API for viewing and signing up for extracurricular activities")
@@ -81,6 +88,73 @@ activities = {
 @app.get("/")
 def root():
     return RedirectResponse(url="/static/index.html")
+
+
+# --- Admin auth (JWT) -------------------------------------------------
+# Environment variables:
+#  - ADMIN_USERNAME (default: admin)
+#  - ADMIN_PASSWORD (default: admin)
+#  - SECRET_KEY (optional, will be generated if missing)
+
+ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "admin")
+ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "admin")
+SECRET_KEY = os.getenv("SECRET_KEY") or "".join(os.urandom(24).hex())
+ALGORITHM = "HS256"
+ACCESS_TOKEN_EXPIRE_MINUTES = 60
+
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/admin/token")
+
+def authenticate_admin(username: str, password: str) -> bool:
+    """Validate admin credentials against env vars (bcrypt-compatible)."""
+    if username != ADMIN_USERNAME:
+        return False
+    # If stored password looks like a bcrypt hash (starts with $2b$ or $2a$), verify
+    if ADMIN_PASSWORD.startswith("$2b$") or ADMIN_PASSWORD.startswith("$2a$"):
+        return bcrypt.verify(password, ADMIN_PASSWORD)
+    # Otherwise compare directly (useful for local dev only)
+    return password == ADMIN_PASSWORD
+
+def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
+    to_encode = data.copy()
+    expire = datetime.utcnow() + (expires_delta or timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES))
+    to_encode.update({"exp": expire})
+    return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+
+async def get_current_admin(token: str = Depends(oauth2_scheme)):
+    credentials_exception = HTTPException(
+        status_code=401,
+        detail="Could not validate credentials",
+    )
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        username: str = payload.get("sub")
+        if username is None or username != ADMIN_USERNAME:
+            raise credentials_exception
+    except JWTError:
+        raise credentials_exception
+    return {"username": username}
+
+
+@app.post("/admin/token")
+async def login_for_access_token(form_data: OAuth2PasswordRequestForm = Depends()):
+    if not authenticate_admin(form_data.username, form_data.password):
+        raise HTTPException(status_code=401, detail="Incorrect username or password")
+    access_token = create_access_token(data={"sub": form_data.username})
+    return {"access_token": access_token, "token_type": "bearer"}
+
+
+@app.get("/admin/dashboard")
+async def admin_dashboard(current_admin: dict = Depends(get_current_admin)):
+    """A small protected admin dashboard showing basic stats."""
+    total_activities = len(activities)
+    total_participants = sum(len(a["participants"]) for a in activities.values())
+    return {
+        "admin": current_admin["username"],
+        "total_activities": total_activities,
+        "total_participants": total_participants,
+    }
+
+# ---------------------------------------------------------------------
 
 
 @app.get("/activities")
